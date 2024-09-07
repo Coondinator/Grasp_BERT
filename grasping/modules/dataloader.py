@@ -46,7 +46,21 @@ def pc_normalize(pc):
     return pc
 
 
-def farthest_point_sample(point, color, npoint):
+def random_point_sample(point, npoints):
+    """
+    Input:
+        xyz: pointcloud data, [N, D]
+        npoint: number of samples
+    Return:
+        centroids: sampled pointcloud index, [npoint, D]
+    """
+    N, D = point.shape
+    centroids = np.random.choice(N, npoints)
+    point = point[centroids.astype(np.int32)].astype(np.float32)
+    return point
+
+
+def farthest_point_sample(point, npoint):
     """
     Input:
         xyz: pointcloud data, [N, D]
@@ -66,18 +80,93 @@ def farthest_point_sample(point, color, npoint):
         mask = dist < distance
         distance[mask] = dist[mask]
         farthest = np.argmax(distance, -1)
-    point = point[centroids.astype(np.int32)]
-    color = color[centroids.astype(np.int32)]
-    return point, color
+    new_point = point[centroids.astype(np.int32)].astype(np.float32)
+    return new_point
+
+
+def fast_fps(point, npoints):
+    new_index = fpsample.bucket_fps_kdline_sampling(point, npoints, 5)
+    new_point = point[new_index.astype(np.int32)].astype(np.float32)
+    return new_point
+
+
+def read_tracker_from_row(row):
+    left_label = row['left_gripper']
+    if left_label == 0:
+        left_pos = np.zeros((3))
+    else:
+        left_pos_str = row['grasp_pos_left']
+        left_pos = re.findall(r"[-+]?\d*\.\d+|\d+", left_pos_str)
+        left_pos = np.array(list(map(float, left_pos)))
+
+    right_label = row['right_gripper']
+    if right_label == 0:
+        right_pos = np.zeros((3))
+    else:
+        right_pos_str = row['grasp_pos_right']
+        right_pos = re.findall(r"[-+]?\d*\.\d+|\d+", right_pos_str)
+        right_pos = np.array(list(map(float, right_pos)))
+
+    left_ori_str = row['original_ori_left']
+    right_ori_str = row['original_ori_right']
+
+    left_ori = re.findall(r"[-+]?\d*\.\d+|\d+", left_ori_str)
+    left_ori = np.array(list(map(float, left_ori)))
+    right_ori = re.findall(r"[-+]?\d*\.\d+|\d+", right_ori_str)
+    right_ori = np.array(list(map(float, right_ori)))
+
+    orient = np.stack((left_ori, right_ori), axis=0).astype(np.float32)
+    pos = np.stack((left_pos, right_pos), axis=0).astype(np.float32)
+    label = np.array([left_label, right_label]).astype(np.float32)
+
+    return pos, orient, label
+
+def read_tracker_from_index(file, index):
+    result = file[file['time'] == str(index)]
+    # result = file[file['pc_time'] == index]
+    if result.empty:
+        print('No such index in tracker.csv:', index)
+        return None, None, None
+
+    left_label = result.iloc[0]['left_gripper']
+
+    if left_label == 0:
+        left_pos = np.zeros((3))
+    else:
+        left_pos_str = result.iloc[0]['grasp_pos_left']
+        left_pos = re.findall(r"[-+]?\d*\.\d+|\d+", left_pos_str)
+        left_pos = np.array(list(map(float, left_pos)))
+
+    right_label = result.iloc[0]['right_gripper']
+    if right_label == 0:
+        right_pos = np.zeros((3))
+    else:
+        right_pos_str = result.iloc[0]['grasp_pos_right']
+        right_pos = re.findall(r"[-+]?\d*\.\d+|\d+", right_pos_str)
+        right_pos = np.array(list(map(float, right_pos)))
+
+    left_ori_str = result.iloc[0]['original_ori_left']
+    right_ori_str = result.iloc[0]['original_ori_right']
+
+    left_ori = re.findall(r"[-+]?\d*\.\d+|\d+", left_ori_str)
+    left_ori = np.array(list(map(float, left_ori)))
+    right_ori = re.findall(r"[-+]?\d*\.\d+|\d+", right_ori_str)
+    right_ori = np.array(list(map(float, right_ori)))
+
+    orient = np.concatenate((left_ori, right_ori), axis=0).astype(np.float32)
+    pos = np.concatenate((left_pos, right_pos), axis=0).astype(np.float32)
+    label = np.array([left_label, right_label]).astype(int)
+
+    return pos, orient, label
 
 class GraspDataset(torch.utils.data.Dataset):
-    def __init__(self, root_dir, num_points=4096, from_csv=False, first_load=False):
+    def __init__(self, root_dir, csv_file, num_points=4096, from_csv=False, first_load=False):
         label_list = []
         poses_list = []
         orient_list = []
         point_list = []
         point_cloud_path = os.path.join(root_dir, 'grasp_point')
-        df = pd.read_csv(os.path.join(root_dir, 'combined_all_gripper_changes.csv'))  # 替换为你的CSV文件名
+        df = pd.read_csv(os.path.join(root_dir, csv_file))  # 替换为你的CSV文件名
         if from_csv:
             for index, row in tqdm(df.iterrows(), total=df.shape[0]):
                 # print(row['pc_time'])
@@ -89,18 +178,17 @@ class GraspDataset(torch.utils.data.Dataset):
                     print('No such file:', os.path.join(point_cloud_path, cloth_type, cloud_name))
                     continue
 
-                pos, rot, label = self.read_tracker_from_row(row)
+                pos, rot, label = read_tracker_from_row(row)
                 pcd_data = o3d.io.read_point_cloud(os.path.join(point_cloud_path, cloth_type, cloud_name))
                 point = np.asarray(pcd_data.points)
                 if point.shape[0] < num_points:
                     # print('File:', os.path.join(point_cloud_path, cloth_type, cloud_name))
                     # print('Raw Points:', point.shape[0])
-                    new_point = self.random_point_sample(point, num_points)
+                    new_point = random_point_sample(point, num_points)
                 else:
-                    new_point = self.fast_fps(point, num_points)
+                    new_point = fast_fps(point, num_points)
 
                 # new_point = fpsample.bucket_fps_kdline_sampling(point, num_points, 5)
-
 
                 poses_list.append(pos)
                 orient_list.append(rot)
@@ -110,18 +198,16 @@ class GraspDataset(torch.utils.data.Dataset):
             for file in tqdm(os.listdir(point_cloud_path)):
                 pcd_data = o3d.io.read_point_cloud(os.path.join(point_cloud_path, file))
                 point = np.asarray(pcd_data.points)
-                new_point = self.farthest_point_sample(point, num_points)
+                new_point = farthest_point_sample(point, num_points)
                 index = file.split('_')[1]
-                pos, rot, label = self.read_tracker_from_index(df, index)
+                pos, rot, label = read_tracker_from_index(df, index)
                 if pos is None:
                     continue
-
 
                 poses_list.append(pos)
                 orient_list.append(rot)
                 label_list.append(label)
                 point_list.append(new_point)
-
 
         self.label = torch.from_numpy(np.array(label_list))
         self.pos = torch.from_numpy(np.array(poses_list))
@@ -139,116 +225,84 @@ class GraspDataset(torch.utils.data.Dataset):
             np.savez(os.path.join(root_dir, 'mean_std.npz'), rot6d_mean=rot_mean, rot6d_std=rot_std, pos_mean=pos_mean,
                      pos_std=pos_std)
 
-    def random_point_sample(self, point, npoints):
-        """
-        Input:
-            xyz: pointcloud data, [N, D]
-            npoint: number of samples
-        Return:
-            centroids: sampled pointcloud index, [npoint, D]
-        """
-        N, D = point.shape
-        centroids = np.random.choice(N, npoints)
-        point = point[centroids.astype(np.int32)].astype(np.float32)
-        return point
+    def __len__(self):
+        return len(self.label)
 
-    def farthest_point_sample(self, point, npoint):
-        """
-        Input:
-            xyz: pointcloud data, [N, D]
-            npoint: number of samples
-        Return:
-            centroids: sampled pointcloud index, [npoint, D]
-        """
-        N, D = point.shape
-        xyz = point[:, :3]
-        centroids = np.zeros((npoint,))
-        distance = np.ones((N,)) * 1e10
-        farthest = np.random.randint(0, N)
-        for i in range(npoint):
-            centroids[i] = farthest
-            centroid = xyz[farthest, :]
-            dist = np.sum((xyz - centroid) ** 2, -1)
-            mask = dist < distance
-            distance[mask] = dist[mask]
-            farthest = np.argmax(distance, -1)
-        new_point = point[centroids.astype(np.int32)].astype(np.float32)
-        return new_point
+    def __getitem__(self, idx):
+        point = self.point_cloud[idx]
+        label = self.label[idx]
+        pos = self.pos[idx]
+        orient = self.orient[idx]
 
-    def fast_fps(self, point, npoints):
-        new_index = fpsample.bucket_fps_kdline_sampling(point, npoints, 5)
-        new_point = point[new_index.astype(np.int32)].astype(np.float32)
-        return new_point
+        return {'point': point, 'label': label, 'pos': pos, 'orient': orient}
 
 
-    def read_tracker_from_row(self, row):
-        left_label = row['left_gripper']
-        if left_label == 0:
-            left_pos = np.zeros((3))
-        else:
-            left_pos_str = row['grasp_pos_left']
-            left_pos = re.findall(r"[-+]?\d*\.\d+|\d+", left_pos_str)
-            left_pos = np.array(list(map(float, left_pos)))
+class GraspDatasetCombined(torch.utils.data.Dataset):
+    def __init__(self, root_dir, csv_list, num_points=4096, from_csv=False, first_load=False):
+        label_list = []
+        poses_list = []
+        orient_list = []
+        point_list = []
+        point_cloud_path = os.path.join(root_dir, 'grasp_point')
+        for csv_file in csv_list:
+            df = pd.read_csv(os.path.join(root_dir, 'grasp_data_garment', csv_file))  # 替换为你的CSV文件名
+            if from_csv:
+                for index, row in tqdm(df.iterrows(), total=df.shape[0]):
+                    # print(row['pc_time'])
+                    subname = str(row['subname'])
+                    match = re.match(r"([^_]+_[^_]+)", subname)
+                    cloth_type = match.group(1) if match else None
+                    cloud_name = 'masked_' + str(row['pc_time']) + '_downsampled_0.0045.pcd'
+                    if not os.path.exists(os.path.join(point_cloud_path, cloth_type, cloud_name)):
+                        print('No such file:', os.path.join(point_cloud_path, cloth_type, cloud_name))
+                        continue
 
-        right_label = row['right_gripper']
-        if right_label == 0:
-            right_pos = np.zeros((3))
-        else:
-            right_pos_str = row['grasp_pos_right']
-            right_pos = re.findall(r"[-+]?\d*\.\d+|\d+", right_pos_str)
-            right_pos = np.array(list(map(float, right_pos)))
+                    pos, rot, label = read_tracker_from_row(row)
+                    pcd_data = o3d.io.read_point_cloud(os.path.join(point_cloud_path, cloth_type, cloud_name))
+                    point = np.asarray(pcd_data.points)
+                    if point.shape[0] < num_points:
+                        # print('File:', os.path.join(point_cloud_path, cloth_type, cloud_name))
+                        # print('Raw Points:', point.shape[0])
+                        new_point = random_point_sample(point, num_points)
+                    else:
+                        new_point = fast_fps(point, num_points)
 
-        left_ori_str = row['original_ori_left']
-        right_ori_str = row['original_ori_right']
+                    # new_point = fpsample.bucket_fps_kdline_sampling(point, num_points, 5)
 
-        left_ori = re.findall(r"[-+]?\d*\.\d+|\d+", left_ori_str)
-        left_ori = np.array(list(map(float, left_ori)))
-        right_ori = re.findall(r"[-+]?\d*\.\d+|\d+", right_ori_str)
-        right_ori = np.array(list(map(float, right_ori)))
+                    poses_list.append(pos)
+                    orient_list.append(rot)
+                    label_list.append(label)
+                    point_list.append(new_point)
+            else:
+                for file in tqdm(os.listdir(point_cloud_path)):
+                    pcd_data = o3d.io.read_point_cloud(os.path.join(point_cloud_path, file))
+                    point = np.asarray(pcd_data.points)
+                    new_point = farthest_point_sample(point, num_points)
+                    index = file.split('_')[1]
+                    pos, rot, label = read_tracker_from_index(df, index)
+                    if pos is None:
+                        continue
 
-        orient = np.stack((left_ori, right_ori), axis=0).astype(np.float32)
-        pos = np.stack((left_pos, right_pos), axis=0).astype(np.float32)
-        label = np.array([left_label, right_label]).astype(np.float32)
+                    poses_list.append(pos)
+                    orient_list.append(rot)
+                    label_list.append(label)
+                    point_list.append(new_point)
 
-        return pos, orient, label
+        self.label = torch.from_numpy(np.array(label_list))
+        self.pos = torch.from_numpy(np.array(poses_list))
+        self.orient = torch.from_numpy(np.array(orient_list))
+        self.point_cloud = torch.from_numpy(np.array(point_list))
 
-    def read_tracker_from_index(self, file, index):
-        result = file[file['time'] == str(index)]
-        # result = file[file['pc_time'] == index]
-        if result.empty:
-            print('No such index in tracker.csv:', index)
-            return None, None, None
+        if first_load:
 
-        left_label = result.iloc[0]['left_gripper']
+            rot6d_data = matrix_to_rotation_6d(quaternion_to_matrix(self.orient))
+            rot6d_data = rot6d_data.view(-1, 6)
+            pose_data = self.pos.view(-1, 3)
 
-        if left_label == 0:
-            left_pos = np.zeros((3))
-        else:
-            left_pos_str = result.iloc[0]['grasp_pos_left']
-            left_pos = re.findall(r"[-+]?\d*\.\d+|\d+", left_pos_str)
-            left_pos = np.array(list(map(float, left_pos)))
-
-        right_label = result.iloc[0]['right_gripper']
-        if right_label == 0:
-            right_pos = np.zeros((3))
-        else:
-            right_pos_str = result.iloc[0]['grasp_pos_right']
-            right_pos = re.findall(r"[-+]?\d*\.\d+|\d+", right_pos_str)
-            right_pos = np.array(list(map(float, right_pos)))
-
-        left_ori_str = result.iloc[0]['original_ori_left']
-        right_ori_str = result.iloc[0]['original_ori_right']
-
-        left_ori = re.findall(r"[-+]?\d*\.\d+|\d+", left_ori_str)
-        left_ori = np.array(list(map(float, left_ori)))
-        right_ori = re.findall(r"[-+]?\d*\.\d+|\d+", right_ori_str)
-        right_ori = np.array(list(map(float, right_ori)))
-
-        orient = np.concatenate((left_ori, right_ori), axis=0).astype(np.float32)
-        pos = np.concatenate((left_pos, right_pos), axis=0).astype(np.float32)
-        label = np.array([left_label, right_label]).astype(int)
-
-        return pos, orient, label
+            _, rot_mean, rot_std = normalize(rot6d_data)
+            _, pos_mean, pos_std = normalize(pose_data)
+            np.savez(os.path.join(root_dir, 'mean_std.npz'), rot6d_mean=rot_mean, rot6d_std=rot_std, pos_mean=pos_mean,
+                     pos_std=pos_std)
 
     def __len__(self):
         return len(self.label)
@@ -260,6 +314,9 @@ class GraspDataset(torch.utils.data.Dataset):
         orient = self.orient[idx]
 
         return {'point': point, 'label': label, 'pos': pos, 'orient': orient}
+
+
+
 
 if __name__ == '__main__':
 
